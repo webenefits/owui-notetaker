@@ -2,7 +2,7 @@
 title: Notetaker
 description: Save chats to notes, optional metadata valves
 author: @chriscstewart & copilot
-version: 0.1.0
+version: 0.2.0
 author_url: https://github.com/chriscstewart
 required_open_webui_version: 0.8.0
 licence: Unlicense
@@ -24,8 +24,6 @@ from open_webui.internal.db import get_db
 from sqlalchemy import func
 from sqlalchemy.orm.attributes import flag_modified
 from zoneinfo import ZoneInfo
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
 
 # ---------------------------------------------------------
@@ -55,7 +53,7 @@ def clean_assistant_message(raw: str) -> str:
     # 4. Remove <model_thinking>...</model_thinking> blocks
     raw = re.sub(r"<model_thinking[\s\S]*?</model_thinking>", "", raw, flags=re.IGNORECASE)
 
-    # 5. Remove plain‑text “Thought for X seconds …” blocks
+    # 5. Remove plain‑text "Thought for X seconds …" blocks
     raw = re.sub(
         r"Thought for .*?seconds[\s\S]*?(?=\n\S|\Z)",
         "",
@@ -63,7 +61,7 @@ def clean_assistant_message(raw: str) -> str:
         flags=re.IGNORECASE
     )
 
-    # 6. Remove “Reasoning:” or “Thinking:” paragraphs
+    # 6. Remove "Reasoning:" or "Thinking:" paragraphs
     raw = re.sub(
         r"(Reasoning:|Thinking:)[\s\S]*?(?=\n\S|\Z)",
         "",
@@ -140,13 +138,6 @@ class Action:
     def __init__(self):
         self.valves = self.Valves()
 
-    executor = ThreadPoolExecutor()
-
-    def get_conversation_title(self, conversation_id, event_emitter=None):
-        with get_db() as db:
-            chat = db.query(Chat).filter(Chat.id == conversation_id).first()
-            return chat.title if chat and chat.title else None
-
     async def action(
         self,
         body: dict,
@@ -159,9 +150,9 @@ class Action:
             if conversation_id is None:
                 return
 
-            # User
+            # FIX: Users.get_user_by_id() is async since OpenWebUI migrated to async DB
             user_dict = __user__[0] if isinstance(__user__, tuple) else __user__
-            user = Users.get_user_by_id(user_dict["id"])
+            user = await Users.get_user_by_id(user_dict["id"])
             user_id = user.id
             user_name = getattr(user, "name", "") or getattr(user, "username", "")
 
@@ -185,16 +176,19 @@ class Action:
 
             model_name = body.get("model", "")
 
-            # Chat tags
+            # FIX: fetch chat once and reuse for both tags and title
             with get_db() as db:
                 chat = db.query(Chat).filter(Chat.id == conversation_id).first()
 
             chat_tags = []
+            chat_name = "Note"
             if chat:
                 if isinstance(chat.meta, dict) and "tags" in chat.meta:
                     chat_tags = chat.meta.get("tags") or []
                 elif hasattr(chat, "tags"):
                     chat_tags = chat.tags or []
+                if chat.title:
+                    chat_name = chat.title
 
             if self.valves.include_tags_header:
                 tag_header_md = (
@@ -281,17 +275,6 @@ class Action:
                         extensions=["tables", "fenced_code", "nl2br"]
                     )
 
-                    async def get_title(cid):
-                        loop = asyncio.get_running_loop()
-                        return await loop.run_in_executor(
-                            self.executor,
-                            self.get_conversation_title,
-                            cid,
-                            __event_emitter__,
-                        )
-
-                    chat_name = await get_title(conversation_id) or "Note"
-
                     new_note = Note(
                         id=conversation_id,
                         user_id=user_id,
@@ -325,5 +308,9 @@ class Action:
                     "data": {"description": "Note updated", "done": True}
                 })
 
-        except Exception:
-            return
+        except Exception as e:
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Notetaker error: {e}", "done": True}
+                })
